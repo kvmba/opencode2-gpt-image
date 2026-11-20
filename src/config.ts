@@ -1,18 +1,18 @@
-import { DEFAULT_IMAGE_MODEL, modelName, type ImageModel } from "./models.js"
+import { CODEX_IMAGE_MODEL, DEFAULT_IMAGE_MODEL, modelName } from "./models.js"
 
 export interface Options {
   baseURL?: string
   apiKey?: string
   backend?: "api" | "codex"
   insecureTLS?: boolean
-  defaultModel?: ImageModel
+  defaultModel?: string
   asyncMode?: "sync" | "sub2api"
   taskTimeoutSeconds?: number
 }
 
 export type ResolvedOptions = Required<Options>
 
-export function executionMode(options: Options = {}): { backend: "api" | "codex"; asyncMode: "sync" | "sub2api" } {
+export function executionMode(options: Options = {}): Pick<ResolvedOptions, "backend" | "asyncMode" | "defaultModel"> {
   const backend = options.backend ?? (process.env.GPT_IMAGE_BACKEND as Options["backend"]) ?? "api"
   if (backend !== "api" && backend !== "codex") throw new Error("backend must be api or codex")
   const asyncMode = options.asyncMode ?? process.env.GPT_IMAGE_ASYNC_MODE ?? "sync"
@@ -20,10 +20,12 @@ export function executionMode(options: Options = {}): { backend: "api" | "codex"
   if (backend === "codex" && asyncMode === "sub2api") {
     throw new Error("Sub2API async image tasks require backend: api")
   }
-  if (backend === "codex" && modelName(options.defaultModel ?? process.env.GPT_IMAGE_DEFAULT_MODEL ?? DEFAULT_IMAGE_MODEL) !== "gpt-image-2") {
-    throw new Error("Codex backend requires defaultModel: gpt-image-2")
+  const defaultModel = modelName(options.defaultModel === undefined
+    ? process.env.GPT_IMAGE_DEFAULT_MODEL ?? DEFAULT_IMAGE_MODEL : options.defaultModel)
+  if (backend === "codex" && defaultModel !== CODEX_IMAGE_MODEL) {
+    throw new Error(`Codex backend requires defaultModel: ${CODEX_IMAGE_MODEL}`)
   }
-  return { backend, asyncMode }
+  return { backend, asyncMode, defaultModel }
 }
 
 function optionalBoolean(value: string | undefined): boolean {
@@ -34,12 +36,11 @@ function optionalBoolean(value: string | undefined): boolean {
 }
 
 export function resolveOptions(options: Options = {}): ResolvedOptions {
-  const { backend, asyncMode } = executionMode(options)
+  const { backend, asyncMode, defaultModel } = executionMode(options)
   const baseURL = options.baseURL ?? (process.env.GPT_IMAGE_BASE_URL || process.env.CPA_BASE_URL || "")
   const apiKey = options.apiKey ?? (process.env.GPT_IMAGE_API_KEY || process.env.CPA_API_KEY || "")
   const insecureTLS = options.insecureTLS ?? optionalBoolean(process.env.GPT_IMAGE_INSECURE_TLS)
   if (typeof insecureTLS !== "boolean") throw new Error("insecureTLS must be a boolean")
-  const defaultModel = modelName(options.defaultModel ?? process.env.GPT_IMAGE_DEFAULT_MODEL ?? DEFAULT_IMAGE_MODEL)
   const taskTimeoutSeconds = options.taskTimeoutSeconds ??
     (process.env.GPT_IMAGE_TASK_TIMEOUT_SECONDS === undefined ? 1800 : Number(process.env.GPT_IMAGE_TASK_TIMEOUT_SECONDS))
   if (!Number.isInteger(taskTimeoutSeconds) || taskTimeoutSeconds < 1 || taskTimeoutSeconds > 1800) {

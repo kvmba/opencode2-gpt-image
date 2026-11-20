@@ -10,19 +10,21 @@ import type { Plugin } from "@opencode/plugin"
 import type { Info, ToolContext } from "@opencode/plugin/promise/tool"
 import { v1CodexAuth, v2CodexAuth } from "../src/auth.js"
 import { imageEndpoint, resolveOptions } from "../src/config.js"
-import { generateImage, resumeImageTask } from "../src/image.js"
+import { generateImage, resumeImageTask, type ImageArgs } from "../src/image.js"
 import GptImagePlugin, { v2TaskTool, v2Tool } from "../src/index.js"
-import { DEFAULT_IMAGE_MODEL, IMAGE_MODELS, modelName } from "../src/models.js"
+import { DEFAULT_IMAGE_MODEL, modelName } from "../src/models.js"
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9VZ91xkAAAAASUVORK5CYII=", "base64")
+// A looping, two-frame GIF, used to check that the output is saved byte for byte.
+const GIF = Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAAQABAAACAkQBACH5BAAKAAAALAAAAAABAAEAAAICTAEAOw==", "base64")
 
-test("only official OpenAI image model names are accepted", () => {
+test("model IDs and proxy aliases are accepted unchanged without a hardcoded list", () => {
   assert.equal(DEFAULT_IMAGE_MODEL, "gpt-image-2")
-  assert.ok(IMAGE_MODELS.includes("gpt-image-2.5-sunburst"))
-  assert.ok(IMAGE_MODELS.includes("gpt-image-2.5-flare"))
-  assert.equal(modelName(undefined), DEFAULT_IMAGE_MODEL)
-  assert.throws(() => modelName("gpt-image-2.5"), /Unsupported model/)
-  assert.throws(() => modelName("openai\/gpt-image-2"), /Unsupported model/)
+  assert.equal(modelName("gpt-image-2.6-sunburst"), "gpt-image-2.6-sunburst")
+  assert.equal(modelName("vendor/Image-Alias:next"), "vendor/Image-Alias:next")
+  for (const invalid of ["", " ", "image\n", "image alias", null, 42]) {
+    assert.throws(() => modelName(invalid), /non-empty string without whitespace/)
+  }
 })
 
 test("proxy options use explicit values before environment, normalize v1 once", () => {
@@ -40,19 +42,20 @@ test("plugin options override environment and validate all new defaults", () => 
     process.env.GPT_IMAGE_BASE_URL = "https://env.test"
     process.env.GPT_IMAGE_API_KEY = "env-key"
     process.env.GPT_IMAGE_INSECURE_TLS = "true"
-    process.env.GPT_IMAGE_DEFAULT_MODEL = "gpt-image-1"
+    process.env.GPT_IMAGE_DEFAULT_MODEL = "gpt-image-2.6-sunburst"
     process.env.GPT_IMAGE_ASYNC_MODE = "sub2api"
     process.env.GPT_IMAGE_TASK_TIMEOUT_SECONDS = "99"
     assert.deepEqual(resolveOptions({ baseURL: "https://option.test", apiKey: "option-key", insecureTLS: false,
-      defaultModel: "gpt-image-2", asyncMode: "sync", taskTimeoutSeconds: 4 }), {
+      defaultModel: "vendor/image-latest", asyncMode: "sync", taskTimeoutSeconds: 4 }), {
       backend: "api", baseURL: "https://option.test", apiKey: "option-key", insecureTLS: false,
-      defaultModel: "gpt-image-2", asyncMode: "sync", taskTimeoutSeconds: 4,
+      defaultModel: "vendor/image-latest", asyncMode: "sync", taskTimeoutSeconds: 4,
     })
     assert.equal(resolveOptions().insecureTLS, true)
+    assert.equal(resolveOptions().defaultModel, "gpt-image-2.6-sunburst")
     assert.equal(resolveOptions().taskTimeoutSeconds, 99)
     assert.throws(() => resolveOptions({ baseURL: "", apiKey: "option-key" }), /requires baseURL and apiKey/)
     assert.throws(() => resolveOptions({ insecureTLS: "yes" as never }), /insecureTLS must be a boolean/)
-    assert.throws(() => resolveOptions({ defaultModel: "proxy-alias" as never }), /Unsupported model/)
+    assert.throws(() => resolveOptions({ defaultModel: "" }), /non-empty string/)
     assert.throws(() => resolveOptions({ asyncMode: "auto" as never }), /asyncMode/)
     assert.throws(() => resolveOptions({ taskTimeoutSeconds: 0 }), /taskTimeoutSeconds/)
   } finally {
@@ -66,7 +69,7 @@ test("plugin options override environment and validate all new defaults", () => 
 test("plugin defaults apply in V1/V2 without per-call async overrides", async () => {
   const dir = await mkdtemp(join(tmpdir(), "gpt-defaults-"))
   const original = globalThis.fetch
-  const calls: { url: string; body?: { model: string } }[] = []
+  const calls: { url: string; body?: { model: string; quality?: string } }[] = []
   globalThis.fetch = async (input, init) => {
     const url = String(input)
     calls.push({ url, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) })
@@ -79,14 +82,14 @@ test("plugin defaults apply in V1/V2 without per-call async overrides", async ()
     return new Response(JSON.stringify({ data: [{ b64_json: PNG.toString("base64") }] }))
   }
   try {
-    const options = { baseURL: "https://proxy.test", apiKey: "key", defaultModel: "gpt-image-1" as const,
+    const options = { baseURL: "https://proxy.test", apiKey: "key", defaultModel: "gpt-image-2.6-sunburst",
       asyncMode: "sub2api" as const, taskTimeoutSeconds: 2 }
     const tool = v2Tool(options, async () => dir, async () => undefined)
     const statuses: string[] = []
     const ctx = { sessionID: "s", signal: new AbortController().signal,
       progress: async ({ status }: { status: string }) => { statuses.push(status) } } as unknown as ToolContext
     const result = await tool.execute({ prompt: "bird" }, ctx)
-    assert.equal(result.metadata?.model, "gpt-image-1")
+    assert.equal(result.metadata?.model, options.defaultModel)
     assert.equal(result.metadata?.execution_mode, "sub2api")
     assert.equal(result.metadata?.task_id, "imgtask_defaults")
     assert.ok(Array.isArray(result.content))
@@ -95,7 +98,7 @@ test("plugin defaults apply in V1/V2 without per-call async overrides", async ()
     assert.equal("async_mode" in (tool.input as { properties: Record<string, unknown> }).properties, false)
     assert.equal("timeout_seconds" in (tool.input as { properties: Record<string, unknown> }).properties, false)
     assert.equal(calls[0].url, "https://proxy.test/v1/images/generations/async")
-    assert.equal(calls[0].body?.model, "gpt-image-1")
+    assert.equal(calls[0].body?.model, options.defaultModel)
     assert.equal(calls[1].url, "https://proxy.test/v1/images/tasks/imgtask_defaults")
     assert.equal(statuses[0], "Submitting Sub2API async image task")
     assert.match(statuses[1], /imgtask_defaults: queued/)
@@ -107,13 +110,14 @@ test("plugin defaults apply in V1/V2 without per-call async overrides", async ()
     assert.equal("async_mode" in v1Tool.args, false)
     assert.equal("timeout_seconds" in v1Tool.args, false)
     assert.match(v1Tool.description, /Configured for Sub2API asynchronous submission/)
-    const override = await v1Tool.execute({ prompt: "bird", model: "gpt-image-2" },
+    const override = await v1Tool.execute({ prompt: "bird", model: "vendor/Image-Alias:next", quality: "max" },
       { directory: dir, abort: ctx.signal, metadata: () => {} })
-    assert.equal(override.metadata.model, "gpt-image-2")
+    assert.equal(override.metadata.model, "vendor/Image-Alias:next")
     assert.equal(override.metadata.execution_mode, "sub2api")
     assert.equal(override.metadata.task_id, "imgtask_defaults")
     assert.equal(calls[2].url, "https://proxy.test/v1/images/generations/async")
-    assert.equal(calls[2].body?.model, "gpt-image-2")
+    assert.equal(calls[2].body?.model, "vendor/Image-Alias:next")
+    assert.equal(calls[2].body?.quality, "max")
 
     await assert.rejects(generateImage({ prompt: "bird", async_mode: false } as never, dir, options), /plugin configuration/)
     const task = await v2TaskTool(options, async () => dir).execute({ task_id: "imgtask_defaults" }, ctx)
@@ -194,6 +198,30 @@ test("V1 and V2 register the same generation and task tools", async () => {
   assert.equal("timeout_seconds" in tool.args, false)
 })
 
+test("API tool schemas expose arbitrary image model IDs and GIF settings", async () => {
+  const options = { defaultModel: "gpt-image-2.6-flare" }
+  const v2 = v2Tool(options, async () => "/session", async () => undefined)
+  const v1 = await GptImagePlugin.server({ directory: "/session" }, options)
+  const { properties } = v2.input as { properties: Record<string, unknown> }
+  const v1Args = (v1.tool.gpt_image as { args: Record<string, { description?: string; safeParse(value: unknown): { success: boolean } }> }).args
+  const model = properties.model as { type: string; pattern: string; enum?: string[]; description: string }
+  assert.equal(model.type, "string")
+  assert.equal(model.enum, undefined)
+  assert.match("proxy/image-v3", new RegExp(model.pattern))
+  assert.match(model.description, /gpt-image-2\.6-flare/)
+  assert.match(v1Args.model.description ?? "", /gpt-image-2\.6-flare/)
+  assert.equal(v1Args.model.safeParse("proxy/image-v3").success, true)
+  assert.equal(v1Args.model.safeParse(" ").success, false)
+  assert.deepEqual((properties.output_format as { enum: string[] }).enum, ["png", "jpeg", "webp", "gif"])
+  assert.equal((properties.frame_count as { maximum: number }).maximum, 16)
+  assert.equal((properties.frame_duration_ms as { minimum: number }).minimum, 20)
+  assert.equal(v1Args.output_format.safeParse("gif").success, true)
+  assert.equal(v1Args.frame_count.safeParse(16).success, true)
+  assert.equal(v1Args.frame_count.safeParse(17).success, false)
+  assert.equal(v1Args.frame_duration_ms.safeParse(20).success, true)
+  assert.equal(v1Args.frame_duration_ms.safeParse(19).success, false)
+})
+
 test("Codex tool descriptions and schemas reflect its configured backend", async () => {
   const options = { backend: "codex" as const }
   const v2 = v2Tool(options, async () => "/session", async () => undefined)
@@ -208,8 +236,13 @@ test("Codex tool descriptions and schemas reflect its configured backend", async
   assert.equal(properties.images.maxItems, 5)
   assert.equal("mask" in properties, false)
   assert.equal("mask" in v1Args, false)
+  for (const field of ["frame_count", "frame_duration_ms"]) {
+    assert.equal(field in properties, false)
+    assert.equal(field in v1Args, false)
+  }
   assert.equal("async_mode" in properties, false)
   assert.equal(v1Args.output_format.safeParse("webp").success, false)
+  assert.equal(v1Args.output_format.safeParse("gif").success, false)
   assert.equal(v1Args.quality.safeParse("high").success, true)
   assert.equal(v1Args.model.safeParse("gpt-image-1").success, false)
   assert.deepEqual(Object.keys(v1.tool), ["gpt_image"])
@@ -273,10 +306,81 @@ test("proxy errors and invalid parameters do not create output", async () => {
   try {
     const config = { baseURL: "https://proxy.test", apiKey: "test" }
     await assert.rejects(generateImage({ prompt: "hi" }, tmpdir(), config), /403.*not available/)
-    await assert.rejects(generateImage({ prompt: "hi", model: "gpt-image-2", quality: "max" }, tmpdir(), config), /2.5/)
     await assert.rejects(generateImage({ prompt: "hi", background: "transparent", output_format: "jpeg" }, tmpdir(), config), /PNG or WebP/)
     await assert.rejects(generateImage({ prompt: "hi", quality: "ultra" as never }, tmpdir(), config), /Unsupported quality/)
   } finally { globalThis.fetch = original }
+})
+
+test("API tools request native animated GIFs for generation and still-image edits", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gpt-gif-"))
+  const original = globalThis.fetch
+  const calls: { url: string; body: Record<string, unknown> }[] = []
+  globalThis.fetch = async (input, init) => {
+    calls.push({ url: String(input), body: JSON.parse(String(init?.body)) })
+    return new Response(JSON.stringify({ data: [{ b64_json: GIF.toString("base64") }] }))
+  }
+  try {
+    const options = { baseURL: "https://proxy.test", apiKey: "test", defaultModel: "gpt-image-2.6-flare" }
+    const signal = new AbortController().signal
+    const v2 = v2Tool(options, async () => dir, async () => undefined)
+    const result = await v2.execute({ prompt: "a looping animation", output_format: "gif", frame_count: 2,
+      frame_duration_ms: 100 }, { sessionID: "s", signal, progress: async () => {} } as unknown as ToolContext)
+    assert.equal(result.metadata?.model, options.defaultModel)
+    assert.equal(result.metadata?.notices, undefined)
+    assert.ok(Array.isArray(result.content))
+    const file = result.content[1]
+    if (file.type !== "file") throw new Error("expected GIF attachment")
+    assert.equal(file.mime, "image/gif")
+    assert.match(file.name ?? "", /\.gif$/)
+    assert.deepEqual(await readFile(fileURLToPath(file.uri)), GIF)
+
+    const v1 = await GptImagePlugin.server({ directory: dir }, options)
+    const v1Tool = v1.tool.gpt_image as { execute(args: ImageArgs, context: unknown): Promise<{
+      attachments: { mime: string; filename: string; url: string }[]
+    }> }
+    const still = `data:image/png;base64,${PNG.toString("base64")}`
+    const edit = await v1Tool.execute({ prompt: "animate this image", model: "gpt-image-2.6-sunburst",
+      output_format: "gif", images: [still] }, { directory: dir, abort: signal })
+    assert.equal(edit.attachments[0].mime, "image/gif")
+    assert.match(edit.attachments[0].filename, /\.gif$/)
+    assert.deepEqual(await readFile(fileURLToPath(edit.attachments[0].url)), GIF)
+    assert.deepEqual(calls, [
+      { url: "https://proxy.test/v1/images/generations", body: { model: options.defaultModel,
+        prompt: "a looping animation", output_format: "gif", frame_count: 2, frame_duration_ms: 100 } },
+      { url: "https://proxy.test/v1/images/edits", body: { model: "gpt-image-2.6-sunburst",
+        prompt: "animate this image", output_format: "gif", images: [{ image_url: still }] } },
+    ])
+  } finally {
+    globalThis.fetch = original
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test("invalid GIF settings and local GIF inputs are rejected before requesting images", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gpt-gif-invalid-"))
+  const original = globalThis.fetch
+  globalThis.fetch = async () => { throw new Error("unexpected image request") }
+  try {
+    const options = { baseURL: "https://proxy.test", apiKey: "test" }
+    const gif = { prompt: "animate", output_format: "gif" } as const
+    for (const frame_count of [1, 17, 2.5]) {
+      await assert.rejects(generateImage({ ...gif, frame_count }, dir, options), /frame_count must be an integer from 2 to 16/)
+    }
+    for (const frame_duration_ms of [19, 20.5]) {
+      await assert.rejects(generateImage({ ...gif, frame_duration_ms }, dir, options), /frame_duration_ms must be an integer of at least 20/)
+    }
+    await assert.rejects(generateImage({ prompt: "bird", frame_count: 3 }, dir, options), /require output_format: gif/)
+    await assert.rejects(generateImage({ prompt: "bird", output_format: "png", frame_duration_ms: 100 }, dir, options), /require output_format: gif/)
+    await assert.rejects(generateImage({ ...gif, images: ["still.png"], mask: "mask.png" }, dir, options), /GIF output does not support masks/)
+    await assert.rejects(generateImage({ ...gif, background: "transparent" }, dir, options), /PNG or WebP/)
+    await writeFile(join(dir, "input.gif"), GIF)
+    await assert.rejects(generateImage({ ...gif, images: ["input.gif"] }, dir, options), /GIF is supported as output only/)
+    await assert.rejects(generateImage(gif, dir, { backend: "codex" }), /only supports PNG output/)
+    await assert.rejects(generateImage({ prompt: "bird", quality: "max" }, dir, { backend: "codex" }), /does not support xhigh or max/)
+  } finally {
+    globalThis.fetch = original
+    await rm(dir, { recursive: true, force: true })
+  }
 })
 
 test("proxy-compatible image URLs are downloaded and identified from bytes", async () => {
@@ -402,7 +506,7 @@ test("Sub2API async generations submit, poll with same key, and download stored 
   }
 })
 
-test("Sub2API async edits and resume polling work in both plugin tool surfaces", async () => {
+test("Sub2API async edits and resume polling save stored GIFs in both plugin tool surfaces", async () => {
   const dir = await mkdtemp(join(tmpdir(), "gpt-async-edit-"))
   const original = globalThis.fetch
   await writeFile(join(dir, "input.png"), PNG)
@@ -411,31 +515,40 @@ test("Sub2API async edits and resume polling work in both plugin tool surfaces",
     const url = String(input)
     if (url.endsWith("/edits/async")) {
       submits++
-      assert.deepEqual(JSON.parse(String(init?.body)).images,
-        [{ image_url: `data:image/png;base64,${PNG.toString("base64")}` }])
+      const body = JSON.parse(String(init?.body))
+      assert.equal(body.model, "proxy/image-latest")
+      assert.equal(body.output_format, "gif")
+      assert.equal(body.frame_count, 2)
+      assert.deepEqual(body.images, [{ image_url: `data:image/png;base64,${PNG.toString("base64")}` }])
       return new Response(JSON.stringify({ task_id: "imgtask_edit", status: "queued" }),
         { status: 202, headers: { "Retry-After": "0" } })
     }
+    if (url === "https://storage.test/animation.png") return new Response(GIF)
     assert.equal(url, "https://proxy.test/v1/images/tasks/imgtask_edit")
     assert.equal(new Headers(init?.headers).get("Authorization"), "Bearer key")
     return new Response(JSON.stringify({ task_id: "imgtask_edit", status: "completed",
-      result: { data: [{ b64_json: PNG.toString("base64") }] } }))
+      result: { data: [{ url: "https://storage.test/animation.png" }] } }))
   }
   try {
-    const options = { baseURL: "https://proxy.test", apiKey: "key", asyncMode: "sub2api" as const }
-    const generated = await generateImage({ prompt: "edit", images: ["input.png"] }, dir, options)
-    assert.equal(generated.length, 1)
+    const options = { baseURL: "https://proxy.test", apiKey: "key", defaultModel: "proxy/image-latest", asyncMode: "sub2api" as const }
+    const generated = await generateImage({ prompt: "edit", images: ["input.png"], output_format: "gif", frame_count: 2 }, dir, options)
+    assert.equal(generated[0].mime, "image/gif")
+    assert.match(generated[0].path, /\.gif$/)
     const taskTool = v2TaskTool(options, async () => dir)
     const context = { sessionID: "session-1", signal: new AbortController().signal,
       progress: async () => {} } as unknown as ToolContext
     const result = await taskTool.execute({ task_id: "imgtask_edit" }, context)
     assert.ok(Array.isArray(result.content))
-    assert.equal(result.content[1].type, "file")
+    const file = result.content[1]
+    if (file.type !== "file") throw new Error("expected GIF attachment")
+    assert.equal(file.mime, "image/gif")
+    assert.deepEqual(await readFile(fileURLToPath(file.uri)), GIF)
     const v1 = await GptImagePlugin.server({ directory: dir }, options)
     const task = v1.tool.gpt_image_task as { execute(args: unknown, ctx: unknown): Promise<{ attachments: { url: string }[] }> }
     const v1Result = await task.execute({ task_id: "imgtask_edit" }, { directory: dir, abort: context.signal, metadata: () => {} })
     assert.equal(v1Result.attachments.length, 1)
     assert.notEqual(v1Result.attachments[0].url, generated[0].uri)
+    assert.deepEqual(await readFile(fileURLToPath(v1Result.attachments[0].url)), GIF)
     assert.equal(submits, 1) // Resuming an existing task never submits a new paid request.
   } finally {
     globalThis.fetch = original
@@ -561,7 +674,7 @@ test("Codex forwards count, size, quality and transparency; reports actual value
     await assert.rejects(generateImage({ prompt: "a crane", mask: "mask.png", images: ["image.png"] }, dir,
       { backend: "codex" }), /does not support image masks/)
     await assert.rejects(generateImage({ prompt: "a crane", output_format: "webp" }, dir,
-      { backend: "codex" }), /cannot guarantee JPEG or WebP/)
+      { backend: "codex" }), /only supports PNG output/)
     assert.equal(calls, 1)
   } finally {
     globalThis.fetch = original

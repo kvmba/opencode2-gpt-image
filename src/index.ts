@@ -1,23 +1,35 @@
 import type { Plugin } from "@opencode/plugin"
 import type { Info } from "@opencode/plugin/promise/tool"
 import { v1CodexAuth, v2CodexAuth } from "./auth.js"
-import { executionMode, resolveOptions, type Options } from "./config.js"
-import { generateImage, resumeImageTask, v1Attachments, type GeneratedImage, type ImageArgs, type ImageRunDetails } from "./image.js"
-import { IMAGE_MODELS } from "./models.js"
+import { executionMode, type Options } from "./config.js"
+import { API_OUTPUT_FORMATS, GIF_FRAME_COUNT, MIN_GIF_FRAME_DURATION_MS, generateImage, resumeImageTask, v1Attachments,
+  type GeneratedImage, type ImageArgs, type ImageRunDetails } from "./image.js"
+import { CODEX_IMAGE_MODEL, MODEL_ID_PATTERN } from "./models.js"
 
 function description(backend: "api" | "codex", asyncMode: "sync" | "sub2api"): string {
   if (backend === "codex") {
-    return "Generate or edit GPT images with ChatGPT OAuth (experimental, best effort). Uses gpt-image-2; sends count (1–4), size, quality, and transparent/opaque background to the Images endpoint. Upstream may return different values. PNG only; this plugin limits reference images to five and does not support masks or async tasks. Saves and attaches the actual files."
+    return `Generate or edit GPT images with ChatGPT OAuth (experimental, best effort). Uses ${CODEX_IMAGE_MODEL}; sends count (1–4), size, quality, and transparent/opaque background to the Images endpoint. Upstream may return different values. PNG only; this plugin limits reference images to five and does not support masks or async tasks. Saves and attaches the actual files.`
   }
   return `Generate or edit GPT images via Sub2API, CLIProxyAPI, or a compatible Images API. ` +
     (asyncMode === "sub2api"
       ? "Configured for Sub2API asynchronous submission and polling. The tool reports the task ID after acceptance; if polling stops, resume with gpt_image_task instead of submitting again. "
       : "Configured for synchronous image requests. ") +
-    "Proxy/model support varies; unsupported requests are not automatically resubmitted. Saves and attaches the actual files."
+    "Use output_format: gif for animated GIFs with a compatible model and backend. Unsupported requests are not automatically resubmitted. Saves and attaches the actual files."
 }
 
 const OUTPUT_DIR = "Destination relative to the invoking session directory, or absolute. Omit to use a self-gitignored .gpt-tmp directory."
-const IMAGES = "Optional reference images: local paths relative to the session, file:// URIs, PNG/JPEG/WebP data URLs, or public HTTP URLs. When supplied, calls /images/edits."
+const IMAGES = "Optional still reference images: local paths relative to the session, file:// URIs, PNG/JPEG/WebP data URLs, or public HTTP URLs. When supplied, calls /images/edits."
+const GIF_FRAME_COUNT_DESCRIPTION = "Frames per animation. Requires output_format: gif; the Images API defaults to 9."
+const GIF_FRAME_DURATION_DESCRIPTION = "Milliseconds per frame. Requires output_format: gif; the Images API defaults to 200 ms and rounds to 10 ms."
+const CODEX_FORMAT_DESCRIPTION = "Codex path only offers PNG; saved extension follows actual bytes."
+const API_FORMAT_DESCRIPTION = "Requested format. gif requests an animated GIF if supported by the model and backend. Saved extension follows actual bytes."
+const API_QUALITY_DESCRIPTION = "Supported quality values depend on the model and backend."
+const MASK_DESCRIPTION = "Optional local PNG path, file:// URI, or PNG data URL. Requires images; incompatible with GIF output."
+
+function modelDescription(codex: boolean, defaultModel: string): string {
+  return codex ? `Codex best-effort backend currently only allows ${CODEX_IMAGE_MODEL}.` :
+    `Images API model ID or proxy alias; omit to use the configured default (${defaultModel}).`
+}
 
 function resultText(images: GeneratedImage[], details?: ImageRunDetails): string {
   const mode = details?.mode === "sub2api" ? `Sub2API async task ${details.taskID ?? "(ID unavailable)"} completed` :
@@ -27,30 +39,30 @@ function resultText(images: GeneratedImage[], details?: ImageRunDetails): string
     (details?.notices.length ? `\nNotes:\n${details.notices.map((notice) => `- ${notice}`).join("\n")}` : "")
 }
 
-function resultMetadata(images: GeneratedImage[], model?: string, details?: ImageRunDetails) {
+function resultMetadata(images: GeneratedImage[], details?: ImageRunDetails) {
   return {
-    ...(model ? { model } : {}), files: images.map((image) => image.path),
+    ...(details?.model ? { model: details.model } : {}), files: images.map((image) => image.path),
     ...(details ? { backend: details.backend, execution_mode: details.mode,
       ...(details.taskID ? { task_id: details.taskID } : {}), ...(details.reported ? { backend_reported: details.reported } : {}),
       ...(details.notices.length ? { notices: details.notices } : {}) } : {}),
   }
 }
 
-function v2Result(images: GeneratedImage[], model?: string, details?: ImageRunDetails) {
+function v2Result(images: GeneratedImage[], details?: ImageRunDetails) {
   return {
     content: [
       { type: "text" as const, text: resultText(images, details) },
       ...images.map(({ uri, mime, path }) => ({ type: "file" as const, uri, mime, name: path.split(/[\\/]/).at(-1)! })),
     ],
-    metadata: resultMetadata(images, model, details),
+    metadata: resultMetadata(images, details),
   }
 }
 
-function v1Result(images: GeneratedImage[], model?: string, details?: ImageRunDetails) {
+function v1Result(images: GeneratedImage[], details?: ImageRunDetails) {
   return {
     title: `${images.length} GPT image(s) saved`,
     output: resultText(images, details),
-    metadata: resultMetadata(images, model, details),
+    metadata: resultMetadata(images, details),
     attachments: v1Attachments(images),
   }
 }
@@ -60,7 +72,7 @@ export function v2Tool(
   directory: (sessionID: string) => Promise<string>,
   loadAuth: () => ReturnType<typeof v2CodexAuth>,
 ): Info {
-  const { backend, asyncMode } = executionMode(options)
+  const { backend, asyncMode, defaultModel } = executionMode(options)
   const codex = backend === "codex"
   return {
     name: "gpt_image",
@@ -69,18 +81,22 @@ export function v2Tool(
       type: "object",
       properties: {
         prompt: { type: "string", description: "Description of the image to generate." },
-        model: { type: "string", enum: codex ? ["gpt-image-2"] : [...IMAGE_MODELS], description: codex ?
-          "Codex best-effort backend currently only allows gpt-image-2." :
-          "Official OpenAI Images API model ID. Defaults to plugin defaultModel (gpt-image-2). Proxy availability varies." },
+        model: { type: "string", ...(codex ? { enum: [CODEX_IMAGE_MODEL] } : { pattern: MODEL_ID_PATTERN.source }),
+          description: modelDescription(codex, defaultModel) },
         count: { type: "integer", minimum: 1, maximum: 4, description: "Request 1–4 images in one call; the backend may return fewer. Multiple paid calls are never made automatically." },
         size: { type: "string", description: codex ? "auto or WIDTHxHEIGHT; sent to Codex, but actual size may differ." : "auto or WIDTHxHEIGHT; support depends on model and proxy." },
         quality: { type: "string", enum: codex ? ["auto", "low", "medium", "high"] : ["auto", "low", "medium", "high", "xhigh", "max"],
-          description: codex ? "Sent to Codex; actual quality may differ." : "xhigh and max require a GPT Image 2.5 model; proxy/model availability varies." },
+          description: codex ? "Sent to Codex; actual quality may differ." : API_QUALITY_DESCRIPTION },
         background: { type: "string", enum: ["auto", "opaque", "transparent"], description: "Transparent output requires PNG or WebP. GPT Image 2 transparency may be preview quality." },
-        output_format: { type: "string", enum: codex ? ["png"] : ["png", "jpeg", "webp"], description: codex ? "Codex path only offers PNG; saved extension follows actual bytes." : "Requested format; saved extension follows actual bytes." },
+        output_format: { type: "string", enum: codex ? ["png"] : [...API_OUTPUT_FORMATS],
+          description: codex ? CODEX_FORMAT_DESCRIPTION : API_FORMAT_DESCRIPTION },
         output_dir: { type: "string", description: OUTPUT_DIR },
         images: { type: "array", items: { type: "string" }, minItems: 1, maxItems: codex ? 5 : 16, description: IMAGES },
-        ...(!codex ? { mask: { type: "string", description: "Optional local PNG path, file:// URI, or PNG data URL. Requires images. Proxy/model support varies." } } : {}),
+        ...(!codex ? {
+          frame_count: { type: "integer", minimum: GIF_FRAME_COUNT.min, maximum: GIF_FRAME_COUNT.max, description: GIF_FRAME_COUNT_DESCRIPTION },
+          frame_duration_ms: { type: "integer", minimum: MIN_GIF_FRAME_DURATION_MS, description: GIF_FRAME_DURATION_DESCRIPTION },
+          mask: { type: "string", description: MASK_DESCRIPTION },
+        } : {}),
       },
       required: ["prompt"],
       additionalProperties: false,
@@ -91,7 +107,7 @@ export function v2Tool(
       let details: ImageRunDetails | undefined
       const images = await generateImage(args, await directory(context.sessionID), options, context.signal, loadAuth,
         (status) => context.progress({ status }), (value) => { details = value })
-      return v2Result(images, args.model ?? resolveOptions(options).defaultModel, details)
+      return v2Result(images, details)
     },
   }
 }
@@ -114,7 +130,7 @@ export function v2TaskTool(options: Options, directory: (sessionID: string) => P
       const args = input as { task_id: string; output_dir?: string; timeout_seconds?: number }
       const images = await resumeImageTask(args.task_id, await directory(context.sessionID), options,
         args.output_dir, args.timeout_seconds, context.signal, (status) => context.progress({ status }))
-      return v2Result(images, undefined, { backend: "api", mode: "sub2api", taskID: args.task_id, notices: [] })
+      return v2Result(images, { backend: "api", mode: "sub2api", taskID: args.task_id, notices: [] })
     },
   }
 }
@@ -123,7 +139,7 @@ export function v2TaskTool(options: Options, directory: (sessionID: string) => P
 async function server(input: { directory: string }, options: Options = {}): Promise<{ tool: Record<string, unknown> }> {
   const { tool } = await import("@opencode-ai/plugin")
   const z = tool.schema
-  const { backend, asyncMode } = executionMode(options)
+  const { backend, asyncMode, defaultModel } = executionMode(options)
   const codex = backend === "codex"
   return {
     tool: {
@@ -131,26 +147,29 @@ async function server(input: { directory: string }, options: Options = {}): Prom
         description: description(backend, asyncMode),
         args: {
           prompt: z.string().describe("Description of the image to generate."),
-          model: z.enum(codex ? ["gpt-image-2"] as const : IMAGE_MODELS).optional().describe(codex ?
-            "Codex best-effort backend currently only allows gpt-image-2." :
-            "Official OpenAI Images API model ID; defaults to plugin defaultModel (gpt-image-2). Proxy availability varies."),
+          model: (codex ? z.enum([CODEX_IMAGE_MODEL]) : z.string().regex(MODEL_ID_PATTERN)).optional()
+            .describe(modelDescription(codex, defaultModel)),
           count: z.number().int().min(1).max(4).optional().describe("Request 1–4 images in one call; backend may return fewer. No automatic paid retries."),
           size: z.string().optional().describe(codex ? "auto or WIDTHxHEIGHT; sent to Codex, actual size may differ." : "auto or WIDTHxHEIGHT; support varies by model and proxy."),
           quality: z.enum(codex ? ["auto", "low", "medium", "high"] as const : ["auto", "low", "medium", "high", "xhigh", "max"] as const).optional().describe(codex ?
-            "Sent to Codex; actual quality may differ." : "xhigh and max require a GPT Image 2.5 model; proxy/model support varies."),
+            "Sent to Codex; actual quality may differ." : API_QUALITY_DESCRIPTION),
           background: z.enum(["auto", "opaque", "transparent"]).optional().describe("Transparent output requires PNG or WebP; GPT Image 2 transparency is in preview."),
-          output_format: z.enum(codex ? ["png"] as const : ["png", "jpeg", "webp"] as const).optional().describe(codex ?
-            "Codex path only offers PNG; saved extension follows actual bytes." : "Requested format; saved extension follows actual bytes."),
+          output_format: z.enum(codex ? ["png"] as const : API_OUTPUT_FORMATS).optional()
+            .describe(codex ? CODEX_FORMAT_DESCRIPTION : API_FORMAT_DESCRIPTION),
           output_dir: z.string().optional().describe(OUTPUT_DIR),
           images: z.array(z.string()).min(1).max(codex ? 5 : 16).optional().describe(IMAGES),
-          ...(!codex ? { mask: z.string().optional().describe("Optional local PNG path, file:// URI, or PNG data URL. Requires images. Proxy/model support varies.") } : {}),
+          ...(!codex ? {
+            frame_count: z.number().int().min(GIF_FRAME_COUNT.min).max(GIF_FRAME_COUNT.max).optional().describe(GIF_FRAME_COUNT_DESCRIPTION),
+            frame_duration_ms: z.number().int().min(MIN_GIF_FRAME_DURATION_MS).optional().describe(GIF_FRAME_DURATION_DESCRIPTION),
+            mask: z.string().optional().describe(MASK_DESCRIPTION),
+          } : {}),
         },
         async execute(args, context) {
           context.metadata?.({ title: asyncMode === "sub2api" ? "Submitting Sub2API async image task" : "Generating GPT image synchronously" })
           let details: ImageRunDetails | undefined
           const images = await generateImage(args as ImageArgs, context.directory || input.directory, options, context.abort, v1CodexAuth,
             (status) => context.metadata?.({ title: status }), (value) => { details = value })
-          return v1Result(images, args.model ?? resolveOptions(options).defaultModel, details)
+          return v1Result(images, details)
         },
       }),
       ...(!codex ? { gpt_image_task: tool({
@@ -163,7 +182,7 @@ async function server(input: { directory: string }, options: Options = {}): Prom
         async execute(args, context) {
           const images = await resumeImageTask(args.task_id, context.directory || input.directory, options,
             args.output_dir, args.timeout_seconds, context.abort, (status) => context.metadata({ title: status }))
-          return v1Result(images, undefined, { backend: "api", mode: "sub2api", taskID: args.task_id, notices: [] })
+          return v1Result(images, { backend: "api", mode: "sub2api", taskID: args.task_id, notices: [] })
         },
       }) } : {}),
     },

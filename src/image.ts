@@ -3,8 +3,12 @@ import { mkdir, open, readFile, writeFile } from "node:fs/promises"
 import { basename, isAbsolute, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import { imageEndpoint, resolveOptions, type Options, type ResolvedOptions } from "./config.js"
-import { modelName } from "./models.js"
+import { CODEX_IMAGE_MODEL, modelName } from "./models.js"
 import { createTransport, type ImageTransport } from "./transport.js"
+
+export const API_OUTPUT_FORMATS = ["png", "jpeg", "webp", "gif"] as const
+export const GIF_FRAME_COUNT = { min: 2, max: 16 } as const
+export const MIN_GIF_FRAME_DURATION_MS = 20
 
 export interface ImageArgs {
   prompt: string
@@ -13,15 +17,20 @@ export interface ImageArgs {
   size?: string
   quality?: "auto" | "low" | "medium" | "high" | "xhigh" | "max"
   background?: "auto" | "opaque" | "transparent"
-  output_format?: "png" | "jpeg" | "webp"
+  output_format?: (typeof API_OUTPUT_FORMATS)[number]
+  frame_count?: number
+  frame_duration_ms?: number
   output_dir?: string
   images?: string[]
   mask?: string
 }
 
+type ImageRequest = ImageArgs & { model: string }
+
 export interface ImageRunDetails {
   backend: "api" | "codex"
   mode: "sync" | "sub2api"
+  model?: string
   taskID?: string
   notices: string[]
   reported?: { size?: string; quality?: string; background?: string }
@@ -61,16 +70,17 @@ function imageType(bytes: Buffer): { mime: string; ext: string } {
   if (bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") {
     return { mime: "image/webp", ext: ".webp" }
   }
+  const signature = bytes.toString("latin1", 0, 6)
+  if (signature === "GIF87a" || signature === "GIF89a") return { mime: "image/gif", ext: ".gif" }
   throw new Error("Image endpoint returned unsupported or invalid image bytes")
 }
 
 function validate(args: ImageArgs): void {
   if (typeof args.prompt !== "string" || !args.prompt.trim()) throw new Error("prompt is required")
-  modelName(args.model)
   if (args.count !== undefined && (!Number.isInteger(args.count) || args.count < 1 || args.count > 4)) {
     throw new Error("count must be an integer from 1 to 4")
   }
-  if (args.background === "transparent" && args.output_format === "jpeg") {
+  if (args.background === "transparent" && (args.output_format === "jpeg" || args.output_format === "gif")) {
     throw new Error("transparent background requires PNG or WebP")
   }
   if (args.quality && !["auto", "low", "medium", "high", "xhigh", "max"].includes(args.quality)) {
@@ -79,18 +89,26 @@ function validate(args: ImageArgs): void {
   if (args.background && !["auto", "opaque", "transparent"].includes(args.background)) {
     throw new Error("Unsupported background")
   }
-  if (args.output_format && !["png", "jpeg", "webp"].includes(args.output_format)) {
+  if (args.output_format !== undefined && !API_OUTPUT_FORMATS.includes(args.output_format)) {
     throw new Error("Unsupported output_format")
+  }
+  if (args.output_format === "gif" && args.mask !== undefined) throw new Error("GIF output does not support masks")
+  if (args.output_format !== "gif" && (args.frame_count !== undefined || args.frame_duration_ms !== undefined)) {
+    throw new Error("frame_count and frame_duration_ms require output_format: gif")
+  }
+  if (args.frame_count !== undefined && (!Number.isInteger(args.frame_count) ||
+      args.frame_count < GIF_FRAME_COUNT.min || args.frame_count > GIF_FRAME_COUNT.max)) {
+    throw new Error(`frame_count must be an integer from ${GIF_FRAME_COUNT.min} to ${GIF_FRAME_COUNT.max}`)
+  }
+  if (args.frame_duration_ms !== undefined && (!Number.isInteger(args.frame_duration_ms) ||
+      args.frame_duration_ms < MIN_GIF_FRAME_DURATION_MS)) {
+    throw new Error(`frame_duration_ms must be an integer of at least ${MIN_GIF_FRAME_DURATION_MS}`)
   }
   if (args.output_dir !== undefined && (typeof args.output_dir !== "string" || !args.output_dir.trim())) {
     throw new Error("output_dir must be a non-empty path")
   }
   if (args.size !== undefined && args.size !== "auto" && !/^\d+x\d+$/.test(args.size)) {
     throw new Error("size must be auto or WIDTHxHEIGHT")
-  }
-  if ((args.quality === "xhigh" || args.quality === "max") &&
-      !/^gpt-image-2\.5-(sunburst|flare)(-2026-09-08)?$/.test(modelName(args.model))) {
-    throw new Error("xhigh and max quality are only available on GPT Image 2.5 models")
   }
   if (args.images !== undefined && (!Array.isArray(args.images) || !args.images.length || args.images.length > 16 ||
       args.images.some((image) => typeof image !== "string" || !image.trim()))) {
@@ -142,6 +160,7 @@ async function imageReference(value: string, directory: string, mask = false): P
   if (bytes.length > MAX_REFERENCE_BYTES) throw new Error("Reference image exceeds the 20 MiB upload limit")
   const { mime } = imageType(bytes)
   if (mask && mime !== "image/png") throw new Error("mask must be a PNG image")
+  if (mime === "image/gif") throw new Error("GIF is supported as output only; use a PNG, JPEG, or WebP reference image")
   return `data:${mime};base64,${bytes.toString("base64")}`
 }
 
@@ -196,18 +215,20 @@ async function pollTask(id: string, options: ResolvedOptions, transport: ImageTr
   }
 }
 
-async function callAPI(args: ImageArgs, directory: string, options: ResolvedOptions, transport: ImageTransport, signal?: AbortSignal,
+async function callAPI(args: ImageRequest, directory: string, options: ResolvedOptions, transport: ImageTransport, signal?: AbortSignal,
   progress?: (status: string) => void | Promise<void>, details?: ImageRunDetails): Promise<ImageResponse> {
   const { images, mask } = await imageInputs(args, directory)
   const endpoint = images ? "/images/edits" : "/images/generations"
   const body = {
-    model: modelName(args.model),
+    model: args.model,
     prompt: args.prompt,
     ...(args.count !== undefined ? { n: args.count } : {}),
     ...(args.size ? { size: args.size } : {}),
     ...(args.quality ? { quality: args.quality } : {}),
     ...(args.background ? { background: args.background } : {}),
     ...(args.output_format ? { output_format: args.output_format } : {}),
+    ...(args.frame_count !== undefined ? { frame_count: args.frame_count } : {}),
+    ...(args.frame_duration_ms !== undefined ? { frame_duration_ms: args.frame_duration_ms } : {}),
     ...(images ? { images: images.map((image_url) => ({ image_url })) } : {}),
     ...(mask ? { mask: { image_url: mask } } : {}),
   }
@@ -254,9 +275,10 @@ async function callAPI(args: ImageArgs, directory: string, options: ResolvedOpti
   }
 }
 
-async function callCodex(args: ImageArgs, directory: string, loadAuth: AuthLoader | undefined, signal?: AbortSignal): Promise<ImageResponse> {
-  if (modelName(args.model) !== "gpt-image-2") throw new Error("Codex backend only supports gpt-image-2")
-  if (args.output_format && args.output_format !== "png") throw new Error("Codex backend cannot guarantee JPEG or WebP output")
+async function callCodex(args: ImageRequest, directory: string, loadAuth: AuthLoader | undefined, signal?: AbortSignal): Promise<ImageResponse> {
+  if (args.model !== CODEX_IMAGE_MODEL) throw new Error(`Codex backend only supports ${CODEX_IMAGE_MODEL}`)
+  if (args.output_format && args.output_format !== "png") throw new Error("Codex backend only supports PNG output")
+  if (args.quality === "xhigh" || args.quality === "max") throw new Error("Codex backend does not support xhigh or max quality")
   if (args.mask) throw new Error("Codex backend does not support image masks")
   if (args.images && args.images.length > 5) throw new Error("This plugin currently limits Codex to 5 reference images")
   const auth = await loadAuth?.()
@@ -272,7 +294,7 @@ async function callCodex(args: ImageArgs, directory: string, loadAuth: AuthLoade
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-image-2",
+      model: args.model,
       prompt: args.prompt,
       background: args.background ?? "opaque",
       quality: args.quality ?? "auto",
@@ -308,9 +330,10 @@ export async function generateImage(
   onResult?: (details: ImageRunDetails) => void,
 ): Promise<GeneratedImage[]> {
   const config = resolveOptions(options)
-  const effective: ImageArgs = { ...args, model: args.model ?? config.defaultModel }
+  const model = args.model === undefined ? config.defaultModel : modelName(args.model)
+  const effective = { ...args, model }
   validate(effective)
-  const details: ImageRunDetails = { backend: config.backend, mode: config.asyncMode, notices: [] }
+  const details: ImageRunDetails = { backend: config.backend, mode: config.asyncMode, model, notices: [] }
   const transport = await createTransport(config.backend === "api" && config.insecureTLS)
   try {
     const json = config.backend === "codex" ? await callCodex(effective, directory, loadAuth, signal) :

@@ -58,15 +58,17 @@ Add the plugin with its API connection options to `opencode.json`:
 | `apiKey` | Required | Proxy API key |
 | `insecureTLS` | `false` | Disable certificate verification for this plugin's API requests |
 | `backend` | `"api"` | `"api"` for proxies; `"codex"` for experimental subscription use |
-| `defaultModel` | `"gpt-image-2"` | Default OpenAI image model ID |
+| `defaultModel` | `"gpt-image-2"` | Default Images API model ID or proxy alias (`GPT_IMAGE_DEFAULT_MODEL` when unset) |
 | `asyncMode` | `"sync"` | Set `"sub2api"` to submit and poll Sub2API tasks; not a tool argument |
 | `taskTimeoutSeconds` | `1800` | Async polling timeout (1–1800 seconds) |
 
 Options take precedence over the corresponding `GPT_IMAGE_*` environment
 variables; `CPA_BASE_URL` and `CPA_API_KEY` are also supported as fallbacks.
-The tool argument `model` overrides `defaultModel`. Only plugin configuration
-can select async mode and its submission timeout. `insecureTLS` works under
-Node and Bun without changing TLS settings for other plugins.
+The tool argument `model` overrides `defaultModel`. For `backend: "api"`, the
+plugin forwards the selected ID unchanged; set it to a new model or proxy
+alias without changing the plugin. Only plugin configuration can select async
+mode and its submission timeout. `insecureTLS` works under Node and Bun without
+changing TLS settings for other plugins.
 
 ## Usage
 
@@ -80,18 +82,43 @@ Ask the agent to generate an image, or edit one using a reference file:
 
 | Argument | Accepted values |
 | --- | --- |
-| `model` | An [official OpenAI image model ID](https://developers.openai.com/api/reference/resources/images/methods/generate); default `defaultModel` |
+| `model` | An [Images API model ID](https://developers.openai.com/api/reference/resources/images/methods/generate) or a proxy alias; defaults to `defaultModel` |
 | `count` | Request 1–4 images in one call; actual count may vary by backend |
 | `size` | `auto` or `WIDTHxHEIGHT` |
-| `quality` | `auto`, `low`, `medium`, `high`; `xhigh` and `max` for GPT Image 2.5 models |
+| `quality` | `auto`, `low`, `medium`, `high`, `xhigh`, `max`; supported values depend on the backend and model |
 | `background` | `auto`, `opaque`, `transparent` |
-| `output_format` | `png`, `jpeg`, `webp` |
+| `output_format` | `png`, `jpeg`, `webp`, `gif` (animated; API backend only) |
+| `frame_count` | GIF only: 2–16 frames per animation (OpenAI default: 9) |
+| `frame_duration_ms` | GIF only: integer milliseconds per frame, at least 20 (OpenAI default: 200, rounded to 10 ms) |
 | `images` | 1–16 reference images: local paths, `file://`, PNG/JPEG/WebP data URLs, or HTTP(S) URLs |
 | `mask` | Optional local PNG path, `file://` URI, or PNG data URL; requires `images` |
 | `output_dir` | Absolute or session-relative path; default `.gpt-tmp/` (self-gitignored) |
 
-Model availability and supported options depend on the proxy. The plugin
-passes official model IDs unchanged and saves images in their returned format.
+Model availability and supported options depend on the backend. The plugin saves
+and attaches images in their actual returned format.
+
+### Animated GIFs
+
+Use `backend: "api"` and a model with native GIF output, such as
+`gpt-image-2.6-flare` or `gpt-image-2.6-sunburst`. Set the model in `defaultModel`
+or pass it to `gpt_image`:
+
+```json
+{
+  "model": "gpt-image-2.6-flare",
+  "prompt": "A blue origami crane flaps its wings in a seamless loop.",
+  "output_format": "gif",
+  "frame_count": 9,
+  "frame_duration_ms": 200
+}
+```
+
+The backend must support [GIF output](https://developers.openai.com/api/docs/guides/image-generation#generate-animated-gif-output),
+and your account may need preview access.
+Omit `size` or use `"auto"` to let it choose a supported frame size. You can
+guide the animation with still `images`, but GIF output cannot use `mask` or
+`background: "transparent"`. The plugin saves the returned animation as a `.gif`
+without converting or stitching images locally.
 
 ### Sub2API async tasks
 
